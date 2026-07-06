@@ -1,0 +1,17 @@
+# MCUXpresso / Eclipse build output
+/Debug/
+/Release/
+
+# Object & build artifacts
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.axf
+*.list
+
+# OS / editor cruft
+.DS_Store
+*~

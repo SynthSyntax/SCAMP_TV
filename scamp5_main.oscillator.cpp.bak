@@ -1,0 +1,162 @@
+#include <scamp5.hpp>
+#include "MISC/MISC_FUNCS.hpp"
+using namespace SCAMP5_PE;
+
+vs_stopwatch frame_timer;
+vs_stopwatch output_timer;
+
+// Oscillator state / scratch register map (256x256 analog array):
+//   C : oscillator "position"  (the value that oscillates)  -> displayed
+//   D : oscillator "velocity"
+//   B : analog work register that gets halved down to (state/8)
+//   E , F : analog scratch registers clobbered by the diva halving chains
+//   S1 : single-pixel mask (1 only at the middle PE)
+//   S2 : scratch DREG (inverse of S1) used when seeding the value
+
+// ---------------------------------------------------------------------------
+// (re)seed the oscillator: put "amp" into the position register at ONE pixel
+// (r,c), zero everywhere else, and zero the velocity. Called once at start and
+// again whenever the "kick" switch is toggled.
+// ---------------------------------------------------------------------------
+void kick_oscillator(int amp, int r, int c)
+{
+    scamp5_load_point(S1,r,c);          // S1 := 1 only at the middle PE, 0 elsewhere
+
+    scamp5_kernel_begin();
+        res(C,D);                       // position C := 0, velocity D := 0 (whole array)
+    scamp5_kernel_end();
+
+    // scamp5_in drives the analog value across the array; mask it back to a
+    // single pixel so only the middle PE holds the seed value.
+    scamp5_in(C,amp);                   // C := amp (loaded array-wide)
+    scamp5_kernel_begin();
+        NOT(S2,S1);                     // S2 := every PE EXCEPT the middle pixel
+        WHERE(S2);                      // FLAG := everything except the middle pixel
+            res(C);                     // C := 0 there  ->  C = amp ONLY at the middle pixel
+        ALL();                          // FLAG := 1 everywhere (clean state)
+    scamp5_kernel_end();
+}
+
+int main()
+{
+    vs_init();
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //SETUP IMAGE DISPLAYS
+
+    int disp_size = 2;
+    auto display_00 = vs_gui_add_display("C  position (osc)",0,0,disp_size);
+    auto display_01 = vs_gui_add_display("S1 center pixel mask",0,disp_size,disp_size);
+    // auto display_02 = vs_gui_add_display("D  velocity",0,disp_size*2,disp_size);
+
+    // Live scope: plots the center pixel's analog value over time so we can SEE
+    // the sinusoidal dynamics directly on the SCAMP5 GUI.
+    // scamp5_read_areg returns a uint8_t (0..255) with analog 0 near the middle
+    // (~128), so the scope's vertical axis must span the FULL 0..255 range or the
+    // trace bunches up / clips. graph_time_frame = frames shown across the width.
+    int graph_min = 0;
+    int graph_max = 255;
+    int graph_time_frame = 300;
+
+    // a "scope" display needs a plot style; define one (name must be < 16 chars)
+    VS_GUI_DISPLAY_STYLE(style_plot,R"JSON(
+    {
+        "plot_palette": "plot_cmyw",
+        "plot_palette_groups": 4
+    }
+    )JSON");
+
+    auto display_scope = vs_gui_add_display("osc value (scope)",0,disp_size*2,disp_size,style_plot);
+    vs_gui_set_scope(display_scope,graph_min,graph_max,graph_time_frame);   // (handle, min, max, time)
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //SETUP GUI ELEMENTS & CONTROLLABLE VARIABLES
+
+    // The array is 256x256, so the middle pixel is (128,128). Sliders let you
+    // move the single active PE and set the initial kick amplitude.
+    int center_r, center_c, kick_amp, kick;
+    vs_gui_add_slider("center row: ", 0, 255, 128, &center_r);
+    vs_gui_add_slider("center col: ", 0, 255, 128, &center_c);
+    vs_gui_add_slider("kick amplitude: ", -127, 127, 100, &kick_amp);
+    vs_gui_add_switch("kick / restart", 0, &kick);   // toggle to re-seed the oscillator
+
+    // seed the oscillator once so it is already running when the GUI opens
+    kick_oscillator(kick_amp,center_r,center_c);
+    int kick_prev = kick;
+
+    // Frame Loop
+    while(1)
+    {
+        frame_timer.reset();//reset frame_timer
+
+       	vs_disable_frame_trigger();
+        vs_frame_loop_control();
+
+    	//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+		//re-seed the oscillator whenever the kick switch is toggled (either direction)
+
+			if(kick != kick_prev){
+				kick_oscillator(kick_amp,center_r,center_c);
+				kick_prev = kick;
+			}
+
+    	//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+		//ONE integration step of a harmonic oscillator, restricted to the single center pixel
+		//
+		//   C += (1/8)*D
+		//   D -= (1/8)*C     (uses the just-updated C -> stable semi-implicit Euler)
+		//
+		//k = 1/8 sets the frequency; use more/fewer diva stages for slower/faster oscillation.
+		//diva(y0,y1,y2) halves y0 in place (y1,y2 are scratch) using the charge-conserving
+		//divide -> much lower noise than divq.
+
+			scamp5_load_point(S1,center_r,center_c);   // keep the single-pixel mask current
+
+			scamp5_kernel_begin();
+				WHERE(S1);              // FLAG := middle pixel only  ->  analog domain = 1 PE
+
+					mov(B,D);           // B = D   (preserve velocity D)
+					diva(B,E,F);        // B = D/2
+					diva(B,E,F);        // B = D/4
+					diva(B,E,F);        // B = D/8
+					add(C,C,B);         // C = C + D/8
+
+					mov(B,C);           // B = C   (preserve position C)
+					diva(B,E,F);        // B = C/2
+					diva(B,E,F);        // B = C/4
+					diva(B,E,F);        // B = C/8
+					sub(D,D,B);         // D = D - C/8
+
+				ALL();                  // release the mask so the full array can be read out
+			scamp5_kernel_end();
+
+		//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+		//OUTPUT RESULTS
+
+	    	output_timer.reset();
+			scamp5_output_image(C,display_00);   // watch the middle pixel pulse
+			// scamp5_output_image(S1,display_01);  // the single active PE
+			// scamp5_output_image(D,display_02);   // velocity field
+			int output_time_microseconds = output_timer.get_usec();
+
+		//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+		//OUTPUT TEXT INFO
+
+			// read the oscillating analog value at the middle pixel and stream it to the host
+			int osc_value = scamp5_read_areg(C,center_r,center_c);
+
+			// push that value to the scope so it is plotted live on the GUI
+			int16_t plotted_value[1];
+			plotted_value[0] = (int16_t)osc_value;
+			vs_post_set_channel(display_scope);
+			vs_post_int16(plotted_value,1,1);
+
+			vs_post_text("osc @ (%d,%d) = %d\n",center_r,center_c,osc_value);
+
+			int frame_time_microseconds = frame_timer.get_usec(); //get the time taken this frame
+			int max_possible_frame_rate = 1000000/frame_time_microseconds; //calculate the possible max FPS
+			int image_output_time_percentage = (output_time_microseconds*100)/frame_time_microseconds; //calculate the % of frame time which is used for image output
+			vs_post_text("frame time %d microseconds(%%%d image output), potential FPS ~%d \n",frame_time_microseconds,image_output_time_percentage,max_possible_frame_rate); //display this values on host
+    }
+    return 0;
+}
