@@ -15,3 +15,8 @@
 # OS / editor cruft
 .DS_Store
 *~
+
+.settings
+.cproject
+.project
+scamp5_main.oscillator.cpp.bak
