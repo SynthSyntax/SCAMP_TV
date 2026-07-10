@@ -20,7 +20,8 @@ using namespace SCAMP5_PE;
 //
 // Registers:
 //   A : theta (phase state)         C,D,E,F : analog scratch
-//   B : captured intensity          NEWS used by movx
+//   B : captured intensity (displayed early, then reused as a coupling
+//       constant)                   NEWS used by movx
 // ===========================================================================
 
 vs_stopwatch frame_timer;
@@ -69,8 +70,10 @@ int main()
         vs_frame_loop_control();
 
         //////////////////////////////////////////////////////////////////////
-        //1) capture light intensity into B
+        //1) capture light intensity into B, and display it NOW: step 4
+        //   reuses B as a constant, so it must be shown before then
             scamp5_kernel_begin(); get_image(B,F); scamp5_kernel_end();
+            scamp5_output_image(B,display_int);     // the intensity / frequency map
 
         //////////////////////////////////////////////////////////////////////
         //2) frequency omega -> C :  C = base_freq + (intensity+128)/2^freq_gain
@@ -89,18 +92,46 @@ int main()
             scamp5_kernel_begin(); add(A,A,C); scamp5_kernel_end();
 
         //////////////////////////////////////////////////////////////////////
-        //4) optional weak coupling: theta += K*(neighbour_avg - theta)  -> sync
+        //4) optional weak coupling: theta += K*avg_n( wrap(theta_n - theta) )
+        //   Phase lives on a CIRCLE, so each neighbour difference must be
+        //   wrapped into [-60,60) BEFORE use: +59 vs -59 are 2 apart, not
+        //   -118. Coupling on the raw linear difference kicks wrap-straddling
+        //   pixels the long way round, shearing the field into noise at every
+        //   turn. Wrapped-linear = sawtooth coupling, the analog-friendly
+        //   stand-in for Kuramoto's sin(). B is free here (already displayed)
+        //   and holds the wrap threshold; F holds one turn.
             if(couple>0){
+                scamp5_in(B,-60);            // wrap threshold
+                scamp5_in(F,-120);           // one full turn (negative)
                 scamp5_kernel_begin();
-                    // C := average of the 4 neighbour phases (overflow-safe: /4 each)
-                    movx(C,A,north); divq(D,C); divq(C,D);
-                    movx(D,A,south); divq(E,D); divq(D,E); add(C,C,D);
-                    movx(D,A,east);  divq(E,D); divq(D,E); add(C,C,D);
-                    movx(D,A,west);  divq(E,D); divq(D,E); add(C,C,D);  // C = avg
-                    sub(D,C,A);      // D = avg - theta
+                    res(C);                  // C accumulates the mean wrapped difference
+
+                    movx(E,A,north); sub(D,E,A);            // D = theta_n - theta
+                    where(D,B); add(D,D,F); all();          // D > +60 : D -= 120
+                    neg(E,D);
+                    where(E,B); sub(D,D,F); all();          // D < -60 : D += 120
+                    divq(E,D); divq(D,E); add(C,C,D);       // C += D/4
+
+                    movx(E,A,south); sub(D,E,A);
+                    where(D,B); add(D,D,F); all();
+                    neg(E,D);
+                    where(E,B); sub(D,D,F); all();
+                    divq(E,D); divq(D,E); add(C,C,D);
+
+                    movx(E,A,east);  sub(D,E,A);
+                    where(D,B); add(D,D,F); all();
+                    neg(E,D);
+                    where(E,B); sub(D,D,F); all();
+                    divq(E,D); divq(D,E); add(C,C,D);
+
+                    movx(E,A,west);  sub(D,E,A);
+                    where(D,B); add(D,D,F); all();
+                    neg(E,D);
+                    where(E,B); sub(D,D,F); all();
+                    divq(E,D); divq(D,E); add(C,C,D);       // C = avg wrapped diff
                 scamp5_kernel_end();
-                for(int s=0;s<couple;s++){ scamp5_kernel_begin(); divq(E,D); mov(D,E); scamp5_kernel_end(); }
-                scamp5_kernel_begin(); add(A,A,D); scamp5_kernel_end();  // theta += K*(avg-theta)
+                for(int s=0;s<couple;s++){ scamp5_kernel_begin(); divq(E,C); mov(C,E); scamp5_kernel_end(); }
+                scamp5_kernel_begin(); add(A,A,C); scamp5_kernel_end();  // theta += K*avg wrapped diff
             }
 
         //////////////////////////////////////////////////////////////////////
@@ -128,7 +159,6 @@ int main()
         //////////////////////////////////////////////////////////////////////
         //OUTPUT
             scamp5_output_image(A,display_phase);   // phase field (synced regions share a shade)
-            scamp5_output_image(B,display_int);     // the intensity / frequency map
 
             int16_t pv[1];
             pv[0] = (int16_t)scamp5_read_areg(A,probe_r,probe_c);
