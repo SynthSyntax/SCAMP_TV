@@ -21,3 +21,6 @@
 .cproject
 .project
 scamp5_main.oscillator.cpp.bak
+
+# sim stuff
+sim*

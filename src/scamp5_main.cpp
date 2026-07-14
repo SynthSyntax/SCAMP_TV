@@ -20,8 +20,12 @@ using namespace SCAMP5_PE;
 //
 // Registers:
 //   A : theta (phase state)         C,D,E,F : analog scratch
-//   B : captured intensity (displayed early, then reused as a coupling
-//       constant)                   NEWS used by movx
+//   B : captured intensity (displayed early, then reused as the wrap
+//       threshold in the coupling step)
+//   NEWS : routing register, clobbered internally by every analog macro
+//          (mov/add/sub/movx/diva) - never usable as a data buffer.
+//   All divide-by-two use diva (accurate, in-place, needs 2 scratch regs)
+//   rather than divq (quick but low precision).
 // ===========================================================================
 
 vs_stopwatch frame_timer;
@@ -83,7 +87,7 @@ int main()
         //   omega would ramp dark pixels down onto the rail and freeze them).
             scamp5_in(D,base_freq);
             scamp5_kernel_begin(); mov(C,B); scamp5_kernel_end();
-            for(int s=0;s<freq_gain;s++){ scamp5_kernel_begin(); divq(E,C); mov(C,E); scamp5_kernel_end(); }
+            for(int s=0;s<freq_gain;s++){ scamp5_kernel_begin(); diva(C,E,F); scamp5_kernel_end(); }   // C /= 2 in place (diva > divq accuracy; E,F scratch)
             scamp5_in(E,128>>freq_gain);   // offset so darkest pixel maps to ~0
             scamp5_kernel_begin(); add(C,C,E); add(C,C,D); scamp5_kernel_end();   // C = omega > 0
 
@@ -99,38 +103,39 @@ int main()
         //   pixels the long way round, shearing the field into noise at every
         //   turn. Wrapped-linear = sawtooth coupling, the analog-friendly
         //   stand-in for Kuramoto's sin(). B is free here (already displayed)
-        //   and holds the wrap threshold; F holds one turn.
+        //   and holds the wrap threshold (-60); one turn (120) is applied as
+        //   TWO adds of B, which keeps F free as scratch for diva (the
+        //   accurate divide-by-two needs two scratch registers, unlike divq).
             if(couple>0){
-                scamp5_in(B,-60);            // wrap threshold
-                scamp5_in(F,-120);           // one full turn (negative)
+                scamp5_in(B,-60);            // wrap threshold; 2x B = one turn
                 scamp5_kernel_begin();
                     res(C);                  // C accumulates the mean wrapped difference
 
-                    movx(E,A,north); sub(D,E,A);            // D = theta_n - theta
-                    where(D,B); add(D,D,F); all();          // D > +60 : D -= 120
+                    movx(E,A,north); sub(D,E,A);                // D = theta_n - theta
+                    where(D,B); add(D,D,B); add(D,D,B); all();  // D > +60 : D -= 120
                     neg(E,D);
-                    where(E,B); sub(D,D,F); all();          // D < -60 : D += 120
-                    divq(E,D); divq(D,E); add(C,C,D);       // C += D/4
+                    where(E,B); sub(D,D,B); sub(D,D,B); all();  // D < -60 : D += 120
+                    diva(D,E,F); diva(D,E,F); add(C,C,D);       // C += D/4
 
                     movx(E,A,south); sub(D,E,A);
-                    where(D,B); add(D,D,F); all();
+                    where(D,B); add(D,D,B); add(D,D,B); all();
                     neg(E,D);
-                    where(E,B); sub(D,D,F); all();
-                    divq(E,D); divq(D,E); add(C,C,D);
+                    where(E,B); sub(D,D,B); sub(D,D,B); all();
+                    diva(D,E,F); diva(D,E,F); add(C,C,D);
 
                     movx(E,A,east);  sub(D,E,A);
-                    where(D,B); add(D,D,F); all();
+                    where(D,B); add(D,D,B); add(D,D,B); all();
                     neg(E,D);
-                    where(E,B); sub(D,D,F); all();
-                    divq(E,D); divq(D,E); add(C,C,D);
+                    where(E,B); sub(D,D,B); sub(D,D,B); all();
+                    diva(D,E,F); diva(D,E,F); add(C,C,D);
 
                     movx(E,A,west);  sub(D,E,A);
-                    where(D,B); add(D,D,F); all();
+                    where(D,B); add(D,D,B); add(D,D,B); all();
                     neg(E,D);
-                    where(E,B); sub(D,D,F); all();
-                    divq(E,D); divq(D,E); add(C,C,D);       // C = avg wrapped diff
+                    where(E,B); sub(D,D,B); sub(D,D,B); all();
+                    diva(D,E,F); diva(D,E,F); add(C,C,D);       // C = avg wrapped diff
                 scamp5_kernel_end();
-                for(int s=0;s<couple;s++){ scamp5_kernel_begin(); divq(E,C); mov(C,E); scamp5_kernel_end(); }
+                for(int s=0;s<couple;s++){ scamp5_kernel_begin(); diva(C,D,E); scamp5_kernel_end(); }
                 scamp5_kernel_begin(); add(A,A,C); scamp5_kernel_end();  // theta += K*avg wrapped diff
             }
 
