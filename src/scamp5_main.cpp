@@ -30,6 +30,32 @@ using namespace SCAMP5_PE;
 
 vs_stopwatch frame_timer;
 
+// ===========================================================================
+// EDGE READOUT (the "analog autoencoder" tap)
+//
+// Reading the full 256x256 array off-chip is the expensive operation SCAMP is
+// built to avoid. Instead we read ONLY the 4 border lines of the phase field
+// (4x256 = 1024 px = 1.6% of the array) every frame. The travelling waves set
+// up by the Kuramoto coupling carry interior structure outward, so the border
+// time-series is a temporal code for the whole image: a host-side RNN decoder
+// (sim/wave_autoencoder.py) is trained to invert it back into the image.
+//
+// Packets go out on a dedicated raw channel: per frame, one int32 (frame id)
+// followed by a 4x256 int8 array, rows = [north, south, west, east] border.
+// scamp5_scan_areg returns uint8 (analog value + 128); we post it raw and let
+// the host subtract 128.
+// ===========================================================================
+const uint32_t CH_EDGE_DATA = 42;      // raw-packet tag for the host logger
+uint8_t edge_buf[4][256];
+
+static void post_edges()
+{
+    scamp5_scan_areg(A, edge_buf[0],   0,   0,   0, 255, 1, 1);  // north row
+    scamp5_scan_areg(A, edge_buf[1], 255,   0, 255, 255, 1, 1);  // south row
+    scamp5_scan_areg(A, edge_buf[2],   0,   0, 255,   0, 1, 1);  // west  col
+    scamp5_scan_areg(A, edge_buf[3],   0, 255, 255, 255, 1, 1);  // east  col
+}
+
 int main()
 {
     vs_init();
@@ -53,12 +79,13 @@ int main()
 
     //////////////////////////////////////////////////////////////////////////
     //CONTROLS
-    int base_freq, freq_gain, couple, probe_r, probe_c;
+    int base_freq, freq_gain, couple, probe_r, probe_c, edge_readout;
     vs_gui_add_slider("base freq: ", 0, 30,  4, &base_freq);   // phase step/frame for a dark pixel
     vs_gui_add_slider("freq gain: ", 1,  8,  4, &freq_gain);   // intensity->freq (halvings; bigger=weaker); min 1 so the +offset fits in int8
     vs_gui_add_slider("coupling: ",  0,  6,  0, &couple);      // 0=off; diffusive sync strength (halvings)
     vs_gui_add_slider("probe row: ", 0,255,128, &probe_r);
     vs_gui_add_slider("probe col: ", 0,255,128, &probe_c);
+    vs_gui_add_switch("edge readout", false, &edge_readout);   // stream border phase for the decoder
 
     //////////////////////////////////////////////////////////////////////////
     //INIT: all phases start at 0
@@ -163,6 +190,16 @@ int main()
 
         //////////////////////////////////////////////////////////////////////
         //OUTPUT
+            //edge readout: the decoder's input. Scan the 4 border lines of
+            //theta and post them raw; the interior never leaves the chip.
+            if(edge_readout){
+                post_edges();
+                vs_post_set_channel(CH_EDGE_DATA);
+                int32_t frame_id = t;
+                vs_post_int32(&frame_id,1,1);
+                vs_post_int8((const int8_t*)edge_buf,4,256);
+            }
+
             scamp5_output_image(A,display_phase);   // phase field (synced regions share a shade)
 
             int16_t pv[1];
