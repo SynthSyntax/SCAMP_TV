@@ -30,3 +30,7 @@ __pycache__/
 
 #logs
 *.log
+
+#weights
+*.pt
+sim/*.pt
