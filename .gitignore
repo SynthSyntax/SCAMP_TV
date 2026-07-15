@@ -34,3 +34,6 @@ __pycache__/
 #weights
 *.pt
 sim/*.pt
+
+# animations (large; regenerate with sim/wave_viz.py)
+sim/*.gif
