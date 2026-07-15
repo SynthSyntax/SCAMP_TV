@@ -1,15 +1,12 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["numpy", "torch", "matplotlib"]
-#
-# [[tool.uv.index]]
-# name = "pytorch-cpu"
-# url = "https://download.pytorch.org/whl/cpu"
-# explicit = true
-#
-# [tool.uv.sources]
-# torch = { index = "pytorch-cpu" }
 # ///
+#
+# torch comes from PyPI's default (CUDA) wheel so it runs on the GPU. The
+# previous header pinned the CPU-only index (download.pytorch.org/whl/cpu),
+# which silently forced device=cpu. On an RTX 5090 (Blackwell / sm_120) you
+# need a CUDA >= 12.8 build; the current PyPI torch (cu130) covers it.
 """
 Wave autoencoder: reconstruct an image from ONLY the border of the Kuramoto
 lattice, read over time.

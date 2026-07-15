@@ -24,3 +24,9 @@ scamp5_main.oscillator.cpp.bak
 
 # sim stuff
 sim*
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+#logs
+*.log
