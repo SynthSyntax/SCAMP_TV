@@ -18,10 +18,11 @@ CXXFLAGS += -std=c++14 -O2
 CFLAGS   += -O2
 LDLIBS   += -lusb-1.0 -luv -lpthread
 
-# All library sources EXCEPT the Windows USB backend (we use libusb on Linux)
-# and the devkit's own demo main (it defines main(), which collides with ours).
-LIB_CPP := $(filter-out $(SCAMP)/scamp5d_usb.usbk.cpp $(SCAMP)/debug_main.cpp, \
-                        $(wildcard $(SCAMP)/*.cpp))
+# All library sources EXCEPT the Windows-only backends (usbk USB + vcom serial,
+# both #include <windows.h>; we use libusb + TCP on Linux) and the devkit's own
+# demo main (it defines main(), which collides with ours).
+LIB_CPP := $(filter-out $(SCAMP)/scamp5d_usb.usbk.cpp $(SCAMP)/scamp5d_vcom.cpp \
+                        $(SCAMP)/debug_main.cpp, $(wildcard $(SCAMP)/*.cpp))
 LIB_C   := $(wildcard $(SCAMP)/debug_functions.c)
 
 BUILD := build
