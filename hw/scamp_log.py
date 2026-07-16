@@ -277,9 +277,22 @@ def cmd_debug(args):
         shown += 1
         if shown >= args.n:
             break
-    print("\nreading: mostly-border coords + a block of (0,0) pairs = filler/"
-          "count bug (chip fix);\ninterior coords everywhere = border mask "
-          "not applied on R11 (kernel fix)")
+    # aggregate coordinate histogram over ALL event packets: where do events
+    # actually live? (x-value and y-value counts, top rows/cols)
+    xs, ys = [], []
+    for ch, flat in read_records(args.log):
+        if ch == CH_EVENT and flat[0] >= 0:
+            w = flat[2:2 + int(flat[1])].astype(np.int64)
+            xs.append((w >> 8) & 0xFF)
+            ys.append(w & 0xFF)
+    if xs:
+        x = np.concatenate(xs)
+        y = np.concatenate(ys)
+        bx = np.bincount(x, minlength=256)
+        by = np.bincount(y, minlength=256)
+        top = lambda b: ", ".join(f"{v}:{b[v]}" for v in np.argsort(b)[::-1][:8] if b[v])
+        print(f"\nall {len(x)} events - top x values: {top(bx)}")
+        print(f"all {len(x)} events - top y values: {top(by)}")
 
 
 def cmd_trace(args):
