@@ -233,6 +233,37 @@ def cmd_summary(args):
               f"gt drift {ep['gt_drift']:.2f}")
 
 
+def cmd_debug(args):
+    """Raw stats for individual event packets - separates scan_events filler
+    behaviour (trailing (0,0)/(1,1) pairs) from a failed border mask
+    (coordinates spread over the interior)."""
+    shown, skipped = 0, 0
+    for ch, flat in read_records(args.log):
+        if ch != CH_EVENT or flat[0] < 0:
+            continue
+        skipped += 1
+        if skipped <= args.skip:
+            continue
+        fid, cnt = int(flat[0]), int(flat[1])
+        w = flat[2:2 + cnt].astype(np.int64)
+        x, y = (w >> 8) & 0xFF, w & 0xFF
+        if cnt == 0:
+            print(f"frame {fid:5d}: count    0")
+        else:
+            border = ((x == 0) | (x == N - 1) | (y == 0) | (y == N - 1))
+            z00 = int(((x == 0) & (y == 0)).sum())
+            s11 = int(((x == 1) & (y == 1)).sum())
+            print(f"frame {fid:5d}: count {cnt:4d}  on-border {border.mean()*100:5.1f}%  "
+                  f"(0,0)x{z00:<4d} (1,1)x{s11:<4d}  "
+                  f"x {x.min():3d}-{x.max():3d}  y {y.min():3d}-{y.max():3d}")
+        shown += 1
+        if shown >= args.n:
+            break
+    print("\nreading: mostly-border coords + a block of (0,0) pairs = filler/"
+          "count bug (chip fix);\ninterior coords everywhere = border mask "
+          "not applied on R11 (kernel fix)")
+
+
 def cmd_calibrate(args):
     """Find scan_events' orientation from an episode recorded with BOTH
     readouts on: wraps in the analog border trace must coincide with events."""
@@ -315,6 +346,13 @@ def main():
     c = sub.add_parser("calibrate", help="pin down scan_events orientation")
     c.add_argument("log")
     c.set_defaults(fn=cmd_calibrate)
+
+    d = sub.add_parser("debug", help="raw event-packet stats (diagnose count/mask bugs)")
+    d.add_argument("log")
+    d.add_argument("--n", type=int, default=12, help="packets to show")
+    d.add_argument("--skip", type=int, default=200,
+                   help="skip the first packets (early frames are the sync burst)")
+    d.set_defaults(fn=cmd_debug)
 
     e = sub.add_parser("episodes", help="export decoder-ready episodes")
     e.add_argument("log")

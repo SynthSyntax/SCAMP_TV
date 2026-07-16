@@ -155,8 +155,13 @@ int main()
     scamp5_kernel_begin(); res(A); scamp5_kernel_end();
 
     int t = 0;
-    int ep_prev = 0;   // edge-detect for the "record episode" toggle
-    int ep_left = 0;   // frames remaining in the running episode (0 = idle)
+    int ep_prev = 0;      // edge-detect for the "record episode" toggle
+    int ep_left = 0;      // frames remaining in the running episode (0 = idle)
+    int pending_end = 0;  // 1 = post end marker + end ground truth next frame,
+                          // once B holds a fresh capture again (the coupling
+                          // step clobbers B mid-frame, so end GT can't be read
+                          // in the OUTPUT section - it would be the -60 wrap
+                          // constant, not the image)
 
     // Frame Loop
     while(1)
@@ -179,6 +184,14 @@ int main()
         //    and the ground-truth image, reset every phase to 0 (the decoder
         //    is trained on episodes that start from theta = 0, like the sim),
         //    and stream events for the next ep_frames*256 frames.
+            if(pending_end){                         // close the PREVIOUS episode:
+                int32_t end_hdr[2] = {-2, 0};        // end marker + a fresh end GT
+                vs_post_set_channel(CH_EVENT_DATA);  // (B holds this frame's capture,
+                vs_post_int32(end_hdr,1,2);          // so it's a real image again;
+                post_ground_truth();                 // if the scene moved during the
+                vs_post_text("episode done\n");      // episode, it won't match the start)
+                pending_end = 0;
+            }
             if(episode != ep_prev || (auto_episodes && ep_left == 0)){
                 ep_prev = episode;
                 int32_t hdr[6] = {-1, ep_frames*256, base_freq, freq_gain, couple, 0};
@@ -325,13 +338,8 @@ int main()
                 ep_left--;
                 if((ep_left & 1023) == 0 && ep_left > 0)
                     vs_post_text("episode: %d frames left\n",ep_left);
-                if(ep_left == 0){
-                    int32_t end_hdr[2] = {-2, 0};
-                    vs_post_set_channel(CH_EVENT_DATA);
-                    vs_post_int32(end_hdr,1,2);
-                    post_ground_truth();
-                    vs_post_text("episode done\n");
-                }
+                if(ep_left == 0) pending_end = 1;   // flush end marker + GT next
+                                                    // frame (needs a fresh B)
             }
 
             if(ep_left == 0){   // displays + probe off while recording (see 1)
