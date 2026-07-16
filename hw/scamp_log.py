@@ -144,7 +144,8 @@ def parse_episodes(path: str, flip_scan: bool = True):
             if fid == -1:                       # episode header
                 finalize()
                 cur = dict(config=dict(n_frames=int(flat[1]), base_freq=int(flat[2]),
-                                       freq_gain=int(flat[3]), couple=int(flat[4])),
+                                       freq_gain=int(flat[3]), couple=int(flat[4]),
+                                       inset=int(flat[5]) if len(flat) > 5 else 0),
                            raw_events=[], n_ev_frames=0, gt0=None, gt1=None,
                            edges={}, ok=False, why="", gt_drift=float("nan"))
                 gt_rows, gt_slot = np.zeros((N, N), np.uint8), "gt0"
@@ -200,28 +201,32 @@ def map_coord(x: int, y: int, swap_xy: bool, flip_x: bool, flip_y: bool):
     return x, y   # interpreted as (row, col) after correction
 
 
-def border_indices(r: int, c: int) -> list[int]:
-    """Sim order: [north row, south row, west col, east col]; corners appear
-    in BOTH lines they belong to, exactly as WaveEncoder._edges duplicates
-    them. Interior coords return [] (event-mask failure upstream)."""
+def border_indices(r: int, c: int, inset: int = 0) -> list[int]:
+    """Sim order: [north row, south row, west col, east col] of the readout
+    RING sitting `inset` pixels inside the array. Positions along each line
+    keep the full 0..N-1 index (matching the analog line scans). Ring corners
+    appear in BOTH lines they belong to, exactly as WaveEncoder._edges
+    duplicates them. Off-ring coords return [] (event-mask failure upstream)."""
+    lo, hi = inset, N - 1 - inset
     idx = []
-    if r == 0:
+    if r == lo and lo <= c <= hi:
         idx.append(c)
-    if r == N - 1:
+    if r == hi and lo <= c <= hi:
         idx.append(N + c)
-    if c == 0:
+    if c == lo and lo <= r <= hi:
         idx.append(2 * N + r)
-    if c == N - 1:
+    if c == hi and lo <= r <= hi:
         idx.append(3 * N + r)
     return idx
 
 
 def event_array(ep, swap_xy=False, flip_x=False, flip_y=False):
-    """raw (frame,x,y) -> (M,2) int64 [t, border_index]; counts interior hits."""
+    """raw (frame,x,y) -> (M,2) int64 [t, border_index]; counts off-ring hits."""
+    inset = ep["config"].get("inset", 0)
     out, interior = [], 0
     for t, x, y in ep["raw_events"]:
         r, c = map_coord(x, y, swap_xy, flip_x, flip_y)
-        idx = border_indices(r, c)
+        idx = border_indices(r, c, inset)
         if not idx:
             interior += 1
         out.extend((t, p) for p in idx)
@@ -262,7 +267,8 @@ def cmd_debug(args):
         if cnt == 0:
             print(f"frame {fid:5d}: count    0")
         else:
-            border = ((x == 0) | (x == N - 1) | (y == 0) | (y == N - 1))
+            lo, hi = args.inset, N - 1 - args.inset
+            border = ((x == lo) | (x == hi) | (y == lo) | (y == hi))
             z00 = int(((x == 0) & (y == 0)).sum())
             s11 = int(((x == 1) & (y == 1)).sum())
             print(f"frame {fid:5d}: count {cnt:4d}  on-border {border.mean()*100:5.1f}%  "
@@ -436,6 +442,8 @@ def main():
     d.add_argument("--n", type=int, default=12, help="packets to show")
     d.add_argument("--skip", type=int, default=200,
                    help="skip the first packets (early frames are the sync burst)")
+    d.add_argument("--inset", type=int, default=0,
+                   help="ring inset used by the recording (for the on-border check)")
     d.set_defaults(fn=cmd_debug)
 
     e = sub.add_parser("episodes", help="export decoder-ready episodes")

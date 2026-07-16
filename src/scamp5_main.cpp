@@ -48,12 +48,18 @@ vs_stopwatch frame_timer;
 const uint32_t CH_EDGE_DATA = 42;      // raw-packet tag for the host logger
 uint8_t edge_buf[4][256];
 
-static void post_edges()
+// The readout RING sits `in` pixels inside the array (GUI "ring inset").
+// The outermost lines are anchored by the boundary coupling term (measured:
+// ~1 wrap/px/256f vs ~10 free-running) - but the wrapped-diff coupling
+// saturates at +-60, so the anchor cannot drag a line whose phase gap has
+// wrapped: one or two pixels in, the lattice rotates freely. inset=0 is the
+// raw border (old behaviour).
+static void post_edges(int in)
 {
-    scamp5_scan_areg(A, edge_buf[0],   0,   0,   0, 255, 1, 1);  // north row
-    scamp5_scan_areg(A, edge_buf[1], 255,   0, 255, 255, 1, 1);  // south row
-    scamp5_scan_areg(A, edge_buf[2],   0,   0, 255,   0, 1, 1);  // west  col
-    scamp5_scan_areg(A, edge_buf[3],   0, 255, 255, 255, 1, 1);  // east  col
+    scamp5_scan_areg(A, edge_buf[0],     in,      0,     in,    255, 1, 1);  // north ring row
+    scamp5_scan_areg(A, edge_buf[1], 255-in,      0, 255-in,    255, 1, 1);  // south ring row
+    scamp5_scan_areg(A, edge_buf[2],      0,     in,    255,     in, 1, 1);  // west  ring col
+    scamp5_scan_areg(A, edge_buf[3],      0, 255-in,    255, 255-in, 1, 1);  // east  ring col
 }
 
 // ===========================================================================
@@ -149,6 +155,9 @@ int main()
     vs_gui_add_switch("record episode", false, &episode);      // toggle (either way) = header + ground truth + phase reset + one episode
     vs_gui_add_switch("auto episodes", false, &auto_episodes); // restart back-to-back for bulk collection (starts as soon as it's on)
     vs_gui_add_slider("ep frames x256:", 1, 32, 16, &ep_frames); // episode length / 256 (default 16 -> 4096 frames, the n=256 budget)
+    int inset, mask_probe;
+    vs_gui_add_slider("ring inset: ",  0,  8,  2, &inset);      // events+edges read a ring this far inside (0 = raw border; don't move mid-episode)
+    vs_gui_add_slider("mask probe: ",  0,  5,  0, &mask_probe); // DIAGNOSTIC: stream a known load_rect mask as events (1=N row 2=S row 3=W col 4=E col 5=row0 cols0-127)
 
     //////////////////////////////////////////////////////////////////////////
     //INIT: all phases start at 0
@@ -203,7 +212,7 @@ int main()
             if(pending_start){                       // B was captured after a
                 pending_start = 0;                   // display-less frame: exposure
                                                      // now matches the episode
-                int32_t hdr[6] = {-1, ep_frames*256, base_freq, freq_gain, couple, 0};
+                int32_t hdr[6] = {-1, ep_frames*256, base_freq, freq_gain, couple, inset};
                 vs_post_set_channel(CH_EVENT_DATA);
                 vs_post_int32(hdr,1,6);
                 post_ground_truth();                 // the scene this episode encodes
@@ -298,7 +307,11 @@ int main()
             //backward wrap below stays event-less on purpose: it matches the
             //sim's falling-edge detector (d < -HALF), which only sees
             //forward wraps.
-            scamp5_load_rect(R10, 1, 1, 254, 254);   // interior = rows/cols 1..254
+            //ring masks, REBUILT every frame (DREGs leak). Both rects are
+            //symmetric in coordinates, so any (row,col) ordering or axis
+            //mirroring in load_rect yields the same mask.
+            scamp5_load_rect(R10, inset+1, inset+1, 254-inset, 254-inset); // inside the ring
+            scamp5_load_rect(R12, inset,   inset,   255-inset, 255-inset); // ring + inside
             scamp5_in(D,-60);
             scamp5_in(E,-120);
             scamp5_kernel_begin();
@@ -308,13 +321,14 @@ int main()
                     MOV(R11,FLAG); //   R11 := pixels wrapping THIS frame = the events
                     add(A,A,E);    //   theta -= 120  (wrap down; analog IS FLAG-gated)
                 all();
-                // Border masking with PURE LOGIC. Measured on silicon:
-                // DREG writes DO NOT honour FLAG - a CLR(R11) under
-                // WHERE(R10) cleared every pixel, killing all events (only a
-                // stuck defective DREG cell survived). So compute
-                // R11 := R11 AND NOT interior with unconditional ops:
-                NOT(R12,R11);      // R12 := not-an-event
-                NOR(R11,R12,R10);  // R11 := NOT(no-event OR interior) = event AND border
+                // Ring masking with PURE LOGIC (measured: DREG writes do NOT
+                // honour FLAG, so no conditional CLR). Keep events exactly ON
+                // the ring:  R11 := R11 AND NOT inside AND (ring+inside)
+                NOT(R9,R11);
+                NOR(R11,R9,R10);   // R11 &= NOT inside
+                NOT(R9,R12);       // R9  := outside the ring square
+                NOT(R10,R11);      // (R10 free now, reuse as scratch)
+                NOR(R11,R10,R9);   // R11 &= ring+inside
             scamp5_kernel_end();
             scamp5_in(E,120);
             scamp5_kernel_begin();
@@ -329,7 +343,7 @@ int main()
             //edge readout: the decoder's input. Scan the 4 border lines of
             //theta and post them raw; the interior never leaves the chip.
             if(edge_readout){
-                post_edges();
+                post_edges(inset);
                 edge_pkt[0] = t;
                 const uint8_t*e = (const uint8_t*)edge_buf;
                 for(int i=0;i<256;i++) edge_pkt[1+i] = pack4(e+4*i);
@@ -344,6 +358,14 @@ int main()
             //event at scan-coordinate (0,0) that lands adjacent to the filler
             //is absorbed - at most one corner event per frame, ignorable.
             if(event_readout || ep_left > 0){
+                //DIAGNOSTIC: replace the events with a known load_rect mask,
+                //so the host's `debug` shows exactly which physical pixels a
+                //given load_rect call covers (pins its coordinate convention)
+                if(mask_probe == 1) scamp5_load_rect(R11,   0,  0,   0,255);  // "row 0"
+                if(mask_probe == 2) scamp5_load_rect(R11, 255,  0, 255,255);  // "row 255"
+                if(mask_probe == 3) scamp5_load_rect(R11,   0,  0, 255,  0);  // "col 0"
+                if(mask_probe == 4) scamp5_load_rect(R11,   0,255, 255,255);  // "col 255"
+                if(mask_probe == 5) scamp5_load_rect(R11,   0,  0,   0,127);  // "row 0, cols 0-127" (mirror test)
                 scamp5_scan_events(R11, ev_buf, EV_MAX);
                 int cnt = EV_MAX;
                 while(cnt > 0 && ev_buf[2*cnt-2]==0 && ev_buf[2*cnt-1]==0) cnt--;
