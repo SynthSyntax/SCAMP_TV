@@ -1,26 +1,50 @@
-# Build wave_logger against the scamp5d interface library (Linux).
-#
-# Point DEVKIT at the "scamp5d_interface" folder of the devkit package and
-# build that library first (open vs_interface.workspace in Codeblocks, build
-# the "scamp5d_interface" project - see the devkit README.md). The header
-# and library paths below may need adjusting to your devkit layout; on
-# Windows use the prebuilt scamp5d_interface.lib with Visual Studio and the
-# "scamp5d_interface_app" example project settings instead.
+# Build wave_logger by compiling the scamp5d interface library sources
+# directly (no prebuilt .a, no Code::Blocks). Point SCAMP at the devkit's
+# "scamp5d_interface" folder - the one holding scamp5d_usb.h and the .cpp
+# sources.
 #
 # Dependencies (Ubuntu):  sudo apt-get install libuv1-dev libusb-1.0-0-dev
 # USB permissions: run the devkit's scamp_usb.sh once, or run via sudo.
+#
+#   make                     # uses the SCAMP path below
+#   make SCAMP=/path/to/scamp5d_interface_lib_linux/scamp5d_interface
 
-DEVKIT ?= $(HOME)/scamp5d/scamp5d_interface
+SCAMP ?= /home/bharghav/scamp5/dev_kit/scamp5d_interface_lib_linux/scamp5d_interface
 
-CXX      ?= g++
-CXXFLAGS += -std=c++11 -O2 -I$(DEVKIT) -I$(DEVKIT)/include
-LDFLAGS  += -L$(DEVKIT) -L$(DEVKIT)/lib -L$(DEVKIT)/bin
-LDLIBS   += -lscamp5d_interface -lusb-1.0 -luv -lpthread
+CXX ?= g++
+CC  ?= gcc
+CPPFLAGS += -I$(SCAMP)
+CXXFLAGS += -std=c++14 -O2
+CFLAGS   += -O2
+LDLIBS   += -lusb-1.0 -luv -lpthread
 
-wave_logger: main.cpp
-	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+# All library sources EXCEPT the Windows USB backend (we use libusb on Linux)
+# and the devkit's own demo main (it defines main(), which collides with ours).
+LIB_CPP := $(filter-out $(SCAMP)/scamp5d_usb.usbk.cpp $(SCAMP)/debug_main.cpp, \
+                        $(wildcard $(SCAMP)/*.cpp))
+LIB_C   := $(wildcard $(SCAMP)/debug_functions.c)
+
+BUILD := build
+OBJ := $(BUILD)/main.o \
+       $(patsubst $(SCAMP)/%.cpp,$(BUILD)/%.o,$(LIB_CPP)) \
+       $(patsubst $(SCAMP)/%.c,$(BUILD)/%.o,$(LIB_C))
+
+wave_logger: $(OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/main.o: main.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+$(BUILD)/%.o: $(SCAMP)/%.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
+
+$(BUILD)/%.o: $(SCAMP)/%.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(BUILD):
+	mkdir -p $(BUILD)
 
 clean:
-	rm -f wave_logger
+	rm -rf $(BUILD) wave_logger
 
 .PHONY: clean
