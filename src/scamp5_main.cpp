@@ -56,6 +56,64 @@ static void post_edges()
     scamp5_scan_areg(A, edge_buf[3],   0, 255, 255, 255, 1, 1);  // east  col
 }
 
+// ===========================================================================
+// EVENT READOUT (option B - spike-time coding, sim/wave_events.py)
+//
+// The wrap step already computes, in FLAG, exactly the pixels whose phase
+// crosses +60 this frame - that flip IS the event. We latch FLAG into a
+// DREG (R11), keep only the 4 border lines (interior mask R10, rebuilt every
+// frame because DREGs leak), and read the set pixels out with the chip's
+// sparse address-event scan. Nothing analog is read at all. Expected rate at
+// default settings: background wrap period ~23 frames over 1020 border px
+// -> ~44 events/frame ~ 90 bytes, vs 1024 analog samples for the edge scan;
+// and the digital sparse scan is far cheaper than the per-pixel analog ADC.
+//
+// ALL packets on channels 42/43/44 are int32 arrays (vs_post_int32): the
+// documented host-side decoder callback is case_data_int32 + get_data_channel
+// (hw/host_logger); an int8 handler is not in the scamp5d interface docs.
+// Byte payloads are packed 4-per-word big-endian-in-word, so wire size is
+// unchanged.
+//
+// Channel 43, one packet per frame: { frame_id, count, count x ((x<<8)|y) }.
+//   frame_id -1 = episode header {-1, n_frames, base_freq, freq_gain, couple, 0}
+//   frame_id -2 = episode end marker
+// Channel 44: ground truth = captured intensity B, row by row: { row_id,
+// 64 x packed 4 pixels } (same right-to-left scan quirk as the edges),
+// posted at BOTH episode start and end - the host discards episodes where
+// the two differ (scene moved / slideshow flipped mid-episode).
+// Channel 42 (analog edge scan): { frame_id, 256 x packed 4 samples } =
+// the 4x256 border rows [north, south, west, east].
+//
+// One-time calibration on real silicon: scan_events' (x,y) convention and
+// scan direction are unverified - record one episode with BOTH "edge
+// readout" and "event readout" on, and match wraps in the analog trace to
+// event coordinates.
+// ===========================================================================
+const uint32_t CH_EVENT_DATA = 43;
+const uint32_t CH_GT_IMAGE   = 44;
+#define EV_MAX 1024                    // worst case: the t=0 synchronized wrap fires all 1020 border px
+uint8_t ev_buf[EV_MAX*2];              // raw (x,y) pairs from scan_events
+int32_t ev_pkt[2+EV_MAX];              // packed packet: frame_id, count, coords
+int32_t edge_pkt[1+256];               // packed analog edge packet
+
+static inline int32_t pack4(const uint8_t*p)
+{
+    return ((int32_t)p[0]<<24)|((int32_t)p[1]<<16)|((int32_t)p[2]<<8)|(int32_t)p[3];
+}
+
+static void post_ground_truth()
+{
+    static uint8_t row_buf[256];
+    static int32_t row_pkt[1+64];
+    vs_post_set_channel(CH_GT_IMAGE);
+    for(int r=0;r<256;r++){
+        scamp5_scan_areg(B, row_buf, r, 0, r, 255, 1, 1);
+        row_pkt[0] = r;
+        for(int i=0;i<64;i++) row_pkt[1+i] = pack4(row_buf+4*i);
+        vs_post_int32(row_pkt,1,65);
+    }
+}
+
 int main()
 {
     vs_init();
@@ -80,18 +138,25 @@ int main()
     //////////////////////////////////////////////////////////////////////////
     //CONTROLS
     int base_freq, freq_gain, couple, probe_r, probe_c, edge_readout;
+    int event_readout, episode, auto_episodes, ep_frames;
     vs_gui_add_slider("base freq: ", 0, 30,  4, &base_freq);   // phase step/frame for a dark pixel
     vs_gui_add_slider("freq gain: ", 1,  8,  4, &freq_gain);   // intensity->freq (halvings; bigger=weaker); min 1 so the +offset fits in int8
     vs_gui_add_slider("coupling: ",  0,  6,  0, &couple);      // 0=off; diffusive sync strength (halvings)
     vs_gui_add_slider("probe row: ", 0,255,128, &probe_r);
     vs_gui_add_slider("probe col: ", 0,255,128, &probe_c);
     vs_gui_add_switch("edge readout", false, &edge_readout);   // stream border phase for the decoder
+    vs_gui_add_switch("event readout", false, &event_readout); // stream border wrap events (option B), no episode framing
+    vs_gui_add_switch("record episode", false, &episode);      // toggle (either way) = header + ground truth + phase reset + one episode
+    vs_gui_add_switch("auto episodes", false, &auto_episodes); // restart back-to-back for bulk collection (starts as soon as it's on)
+    vs_gui_add_slider("ep frames x256:", 1, 32, 16, &ep_frames); // episode length / 256 (default 16 -> 4096 frames, the n=256 budget)
 
     //////////////////////////////////////////////////////////////////////////
     //INIT: all phases start at 0
     scamp5_kernel_begin(); res(A); scamp5_kernel_end();
 
     int t = 0;
+    int ep_prev = 0;   // edge-detect for the "record episode" toggle
+    int ep_left = 0;   // frames remaining in the running episode (0 = idle)
 
     // Frame Loop
     while(1)
@@ -104,7 +169,26 @@ int main()
         //1) capture light intensity into B, and display it NOW: step 4
         //   reuses B as a constant, so it must be shown before then
             scamp5_kernel_begin(); get_image(B,F); scamp5_kernel_end();
-            scamp5_output_image(B,display_int);     // the intensity / frequency map
+            if(ep_left == 0)                        // displays off while recording: image
+                scamp5_output_image(B,display_int); // output dominates frame time
+
+        //////////////////////////////////////////////////////////////////////
+        //1b) episode control. MUST run here: B still holds the fresh capture
+        //    (step 4 reuses B as the wrap constant). On a "record episode"
+        //    toggle - or continuously in auto mode - post the config header
+        //    and the ground-truth image, reset every phase to 0 (the decoder
+        //    is trained on episodes that start from theta = 0, like the sim),
+        //    and stream events for the next ep_frames*256 frames.
+            if(episode != ep_prev || (auto_episodes && ep_left == 0)){
+                ep_prev = episode;
+                int32_t hdr[6] = {-1, ep_frames*256, base_freq, freq_gain, couple, 0};
+                vs_post_set_channel(CH_EVENT_DATA);
+                vs_post_int32(hdr,1,6);
+                post_ground_truth();                 // the scene this episode encodes
+                scamp5_kernel_begin(); res(A); scamp5_kernel_end();   // theta := 0
+                t = 0;
+                ep_left = ep_frames*256;
+            }
 
         //////////////////////////////////////////////////////////////////////
         //2) frequency omega -> C :  C = base_freq + (intensity+128)/2^freq_gain
@@ -173,12 +257,28 @@ int main()
         //   Analog registers SATURATE at the rail instead of wrapping, so wrap
         //   by hand - and in BOTH directions, because the coupling kick can
         //   also push theta below the bottom of the range.
+            //The forward wrap IS the event (option B): latch FLAG into R11
+            //before wrapping down, then erase interior pixels so only the 4
+            //border lines can fire. The interior mask R10 is REBUILT every
+            //frame - DREGs leak/flip over time, and a mask loaded once at
+            //startup silently corrupts the event stream minutes in. The
+            //backward wrap below stays event-less on purpose: it matches the
+            //sim's falling-edge detector (d < -HALF), which only sees
+            //forward wraps.
+            scamp5_load_rect(R10, 1, 1, 254, 254);   // interior = rows/cols 1..254
             scamp5_in(D,-60);
             scamp5_in(E,-120);
             scamp5_kernel_begin();
-                where(A,D);       // FLAG := theta > +60
-                    add(A,A,E);   // theta -= 120  (wrap down)
+                all();             // DREG writes are FLAG-gated: clear the
+                CLR(R11);          // latch EVERYWHERE first, or non-wrapping
+                                   // pixels keep last frame's stale events
+                where(A,D);        // FLAG := theta > +60
+                    MOV(R11,FLAG); //   R11 := pixels wrapping THIS frame = the events
+                    add(A,A,E);    //   theta -= 120  (wrap down)
                 all();
+                WHERE(R10);        // FLAG := interior
+                    CLR(R11);      //   no events there: border lines only
+                ALL();
             scamp5_kernel_end();
             scamp5_in(E,120);
             scamp5_kernel_begin();
@@ -194,21 +294,59 @@ int main()
             //theta and post them raw; the interior never leaves the chip.
             if(edge_readout){
                 post_edges();
+                edge_pkt[0] = t;
+                const uint8_t*e = (const uint8_t*)edge_buf;
+                for(int i=0;i<256;i++) edge_pkt[1+i] = pack4(e+4*i);
                 vs_post_set_channel(CH_EDGE_DATA);
-                int32_t frame_id = t;
-                vs_post_int32(&frame_id,1,1);
-                vs_post_int8((const int8_t*)edge_buf,4,256);
+                vs_post_int32(edge_pkt,1,257);
             }
 
-            scamp5_output_image(A,display_phase);   // phase field (synced regions share a shade)
+            //event readout: sparse address-event scan of the wrap latch.
+            //The buffer is prefilled with (1,1) - an interior coordinate the
+            //border mask makes impossible - so the first (1,1) marks the end
+            //of the list and gives the count without any on-chip counting.
+            if(event_readout || ep_left > 0){
+                for(int i=0;i<EV_MAX*2;i++) ev_buf[i] = 1;
+                scamp5_scan_events(R11, ev_buf, EV_MAX);
+                int cnt = 0;
+                while(cnt < EV_MAX && !(ev_buf[2*cnt]==1 && ev_buf[2*cnt+1]==1)) cnt++;
+                ev_pkt[0] = t;
+                ev_pkt[1] = cnt;
+                for(int i=0;i<cnt;i++)
+                    ev_pkt[2+i] = ((int32_t)ev_buf[2*i]<<8)|(int32_t)ev_buf[2*i+1];
+                vs_post_set_channel(CH_EVENT_DATA);
+                vs_post_int32(ev_pkt,1,2+cnt);
+            }
 
-            int16_t pv[1];
-            pv[0] = (int16_t)scamp5_read_areg(A,probe_r,probe_c);
-            vs_post_set_channel(display_scope);
-            vs_post_int16(pv,1,1);                  // sawtooth = the rotation
+            //episode countdown; close with the end marker and a SECOND
+            //ground truth, so the host can reject any episode whose scene
+            //changed mid-run (start and end captures won't match).
+            if(ep_left > 0){
+                ep_left--;
+                if((ep_left & 1023) == 0 && ep_left > 0)
+                    vs_post_text("episode: %d frames left\n",ep_left);
+                if(ep_left == 0){
+                    int32_t end_hdr[2] = {-2, 0};
+                    vs_post_set_channel(CH_EVENT_DATA);
+                    vs_post_int32(end_hdr,1,2);
+                    post_ground_truth();
+                    vs_post_text("episode done\n");
+                }
+            }
 
-            int frame_us = frame_timer.get_usec();
-            vs_post_text("t=%d  frame %d us\n",t,frame_us);
+            if(ep_left == 0){   // displays + probe off while recording (see 1)
+                scamp5_output_image(A,display_phase);   // phase field (synced regions share a shade)
+
+                int16_t pv[1];
+                pv[0] = (int16_t)scamp5_read_areg(A,probe_r,probe_c);
+                vs_post_set_channel(display_scope);
+                vs_post_int16(pv,1,1);                  // sawtooth = the rotation
+            }
+
+            if(ep_left == 0){
+                int frame_us = frame_timer.get_usec();
+                vs_post_text("t=%d  frame %d us\n",t,frame_us);
+            }
             t++;
     }
     return 0;

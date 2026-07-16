@@ -50,6 +50,22 @@ def pick_device(arg: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def feats_from_times(t_k: torch.Tensor, frames: int) -> torch.Tensor:
+    """(B, P, K) first-K wrap times -> (B, P, 3K) decoder features.
+
+    Absent events carry a sentinel > frames. This is the ONE place the
+    spike-timing features are computed: the sim generator below and the
+    real-chip log loader (hw/scamp_log.py) both call it, so the decoder
+    cannot tell where its events came from.
+    """
+    big = float(frames + 1)
+    mask = (t_k < big).float()
+    isi = torch.diff(t_k, dim=2, prepend=torch.zeros_like(t_k[:, :, :1]))
+    t_k = t_k * mask   # zero out sentinel entries
+    isi = isi * mask
+    return torch.cat([t_k / frames, isi / ISI_SCALE, mask], dim=2)
+
+
 @torch.no_grad()
 def encode_events(enc: WaveEncoder, images: torch.Tensor, frames: int, K: int):
     """Run the lattice, detect border wrap events, build timing features.
@@ -75,12 +91,7 @@ def encode_events(enc: WaveEncoder, images: torch.Tensor, frames: int, K: int):
                         torch.full_like(d, big))
     t_sorted, _ = torch.sort(t_all, dim=1)
     t_k = t_sorted[:, :K, :].transpose(1, 2)  # (B, P, K) first K wrap times
-    mask = (t_k < big).float()
-    isi = torch.diff(t_k, dim=2, prepend=torch.zeros_like(t_k[:, :, :1]))
-    t_k = t_k * mask   # zero out sentinel entries
-    isi = isi * mask
-    feats = torch.cat([t_k / frames, isi / ISI_SCALE, mask], dim=2)
-    return feats, spikes
+    return feats_from_times(t_k, frames), spikes
 
 
 def up(cin: int, cout: int) -> nn.Sequential:
