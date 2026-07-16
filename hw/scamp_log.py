@@ -15,16 +15,19 @@ Channels:
                            BOTH episode start and end; episodes whose two
                            captures differ (scene moved mid-run) are dropped.
 
-Orientation gotchas, all fixable here without re-recording:
-  * scamp5_scan_areg scans right-to-left and returns analog+128: every GT row
-    and every edge line is reversed and offset (undone by default,
-    --no-flip-scan to disable).
-  * scamp5_scan_events' (x,y) convention is UNVERIFIED on silicon. Record one
-    episode with BOTH "edge readout" and "event readout" on, then run
-    `calibrate`: it extracts wraps from the analog trace and searches the 16
-    orientation combos (edge line reversal x event swap/flip) for the one
-    where events and analog wraps coincide. Feed the winning flags to
-    `episodes` via --swap-xy/--flip-x/--flip-y.
+Orientation, as MEASURED on this chip (calibrate, IoU 0.964, 2026-07-16):
+  * scan_areg returns analog+128 but our row/column scans need NO reversal
+    (the "right-to-left" doc caveat does not apply to these scan args) -
+    lines are used as-is by default; --flip-scan reverses them if a future
+    setup disagrees.
+  * scan_events returns (x, y) = (column, row): use `episodes --swap-xy`.
+  * If a fresh calibration is ever needed (new chip/firmware): record one
+    episode with BOTH "edge readout" and "event readout" on, run `calibrate`;
+    it matches analog-trace wraps against events over every orientation combo
+    (event swap/flips x per-line analog reversal) and prints the winner.
+  * Caveat: this pins events/edges/GT CONSISTENT with each other, not against
+    the physical world - a joint mirror is undetectable here. Check the first
+    exported GT image against the real scene once; if mirrored, flip all.
 
 Usage:
     pixi run python hw/scamp_log.py summary  log.bin
@@ -403,9 +406,10 @@ def cmd_episodes(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--no-flip-scan", dest="flip_scan", action="store_false",
-                   help="do NOT reverse each scan line (default reverses: "
-                        "scan_areg reads right-to-left)")
+    p.add_argument("--flip-scan", dest="flip_scan", action="store_true",
+                   default=False,
+                   help="reverse each analog scan line (measured: NOT needed "
+                        "on this chip; default off)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("summary", help="list episodes in a log")

@@ -162,6 +162,13 @@ int main()
                           // step clobbers B mid-frame, so end GT can't be read
                           // in the OUTPUT section - it would be the -60 wrap
                           // constant, not the image)
+    int pending_start = 0;// 1 = start the episode next frame. Exposure here is
+                          // the inter-frame time (no frame trigger), and
+                          // displays dominate it - so a GT captured on the
+                          // toggle frame (long, displays on) is brighter than
+                          // every in-episode frame (short, displays off).
+                          // Arming for one display-less frame first makes the
+                          // GT exposure match the episode's omega map.
 
     // Frame Loop
     while(1)
@@ -174,8 +181,9 @@ int main()
         //1) capture light intensity into B, and display it NOW: step 4
         //   reuses B as a constant, so it must be shown before then
             scamp5_kernel_begin(); get_image(B,F); scamp5_kernel_end();
-            if(ep_left == 0)                        // displays off while recording: image
-                scamp5_output_image(B,display_int); // output dominates frame time
+            if(ep_left == 0 && !pending_start)      // displays off while recording (and
+                scamp5_output_image(B,display_int); // while arming): image output
+                                                    // dominates frame time = exposure
 
         //////////////////////////////////////////////////////////////////////
         //1b) episode control. MUST run here: B still holds the fresh capture
@@ -192,8 +200,9 @@ int main()
                 vs_post_text("episode done\n");      // episode, it won't match the start)
                 pending_end = 0;
             }
-            if(episode != ep_prev || (auto_episodes && ep_left == 0)){
-                ep_prev = episode;
+            if(pending_start){                       // B was captured after a
+                pending_start = 0;                   // display-less frame: exposure
+                                                     // now matches the episode
                 int32_t hdr[6] = {-1, ep_frames*256, base_freq, freq_gain, couple, 0};
                 vs_post_set_channel(CH_EVENT_DATA);
                 vs_post_int32(hdr,1,6);
@@ -201,6 +210,10 @@ int main()
                 scamp5_kernel_begin(); res(A); scamp5_kernel_end();   // theta := 0
                 t = 0;
                 ep_left = ep_frames*256;
+            }
+            if(episode != ep_prev || (auto_episodes && ep_left == 0 && pending_end == 0)){
+                ep_prev = episode;
+                pending_start = 1;                   // arm: one display-less frame first
             }
 
         //////////////////////////////////////////////////////////////////////
@@ -230,35 +243,38 @@ int main()
         //   and holds the wrap threshold (-60); one turn (120) is applied as
         //   TWO adds of B, which keeps F free as scratch for diva (the
         //   accurate divide-by-two needs two scratch registers, unlike divq).
+        //   REPLICATE BOUNDARY (measured necessity, not a nicety): beyond the
+        //   physical array edge, movx reads garbage/zero. With the episode-
+        //   start reset synchronising the field, that phantom neighbour's
+        //   pull cancels omega and PINS the whole border below the wrap
+        //   threshold (hw trace: 0.45 wraps/pixel/256f instead of ~10). So
+        //   each direction's edge line replaces the missing neighbour with
+        //   the pixel itself (diff = 0, term drops out) - the same as the
+        //   sim's --boundary replicate. R12 holds the line mask; the analog
+        //   mov IS FLAG-gated (unlike DREG ops), so WHERE works here.
+        //   If a trace still shows pinning after this, the movx direction
+        //   convention is mirrored: swap row 0<->255 and col 0<->255 below.
+        #define COUPLE_DIR(DIR, r0,c0,r1,c1) \
+            scamp5_load_rect(R12, r0, c0, r1, c1); \
+            scamp5_kernel_begin(); \
+                movx(E,A,DIR); \
+                WHERE(R12); mov(E,A); all();                /* replicate at the edge line */ \
+                sub(D,E,A);                                 /* D = theta_n - theta */ \
+                where(D,B); add(D,D,B); add(D,D,B); all();  /* D > +60 : D -= 120 */ \
+                neg(E,D); \
+                where(E,B); sub(D,D,B); sub(D,D,B); all();  /* D < -60 : D += 120 */ \
+                diva(D,E,F); diva(D,E,F); add(C,C,D);       /* C += D/4 */ \
+            scamp5_kernel_end();
+
             if(couple>0){
                 scamp5_in(B,-60);            // wrap threshold; 2x B = one turn
                 scamp5_kernel_begin();
                     res(C);                  // C accumulates the mean wrapped difference
-
-                    movx(E,A,north); sub(D,E,A);                // D = theta_n - theta
-                    where(D,B); add(D,D,B); add(D,D,B); all();  // D > +60 : D -= 120
-                    neg(E,D);
-                    where(E,B); sub(D,D,B); sub(D,D,B); all();  // D < -60 : D += 120
-                    diva(D,E,F); diva(D,E,F); add(C,C,D);       // C += D/4
-
-                    movx(E,A,south); sub(D,E,A);
-                    where(D,B); add(D,D,B); add(D,D,B); all();
-                    neg(E,D);
-                    where(E,B); sub(D,D,B); sub(D,D,B); all();
-                    diva(D,E,F); diva(D,E,F); add(C,C,D);
-
-                    movx(E,A,east);  sub(D,E,A);
-                    where(D,B); add(D,D,B); add(D,D,B); all();
-                    neg(E,D);
-                    where(E,B); sub(D,D,B); sub(D,D,B); all();
-                    diva(D,E,F); diva(D,E,F); add(C,C,D);
-
-                    movx(E,A,west);  sub(D,E,A);
-                    where(D,B); add(D,D,B); add(D,D,B); all();
-                    neg(E,D);
-                    where(E,B); sub(D,D,B); sub(D,D,B); all();
-                    diva(D,E,F); diva(D,E,F); add(C,C,D);       // C = avg wrapped diff
                 scamp5_kernel_end();
+                COUPLE_DIR(north,   0,  0,   0,255)   // row 0 has no north neighbour
+                COUPLE_DIR(south, 255,  0, 255,255)   // row 255 has no south neighbour
+                COUPLE_DIR(east,    0,255, 255,255)   // col 255 has no east neighbour
+                COUPLE_DIR(west,    0,  0, 255,  0)   // col 0 has no west neighbour
                 for(int s=0;s<couple;s++){ scamp5_kernel_begin(); diva(C,D,E); scamp5_kernel_end(); }
                 scamp5_kernel_begin(); add(A,A,C); scamp5_kernel_end();  // theta += K*avg wrapped diff
             }
@@ -346,16 +362,14 @@ int main()
                                                     // frame (needs a fresh B)
             }
 
-            if(ep_left == 0){   // displays + probe off while recording (see 1)
-                scamp5_output_image(A,display_phase);   // phase field (synced regions share a shade)
+            if(ep_left == 0 && !pending_start){   // displays + probe off while
+                scamp5_output_image(A,display_phase);   // recording or arming (see 1)
 
                 int16_t pv[1];
                 pv[0] = (int16_t)scamp5_read_areg(A,probe_r,probe_c);
                 vs_post_set_channel(display_scope);
                 vs_post_int16(pv,1,1);                  // sawtooth = the rotation
-            }
 
-            if(ep_left == 0){
                 int frame_us = frame_timer.get_usec();
                 vs_post_text("t=%d  frame %d us\n",t,frame_us);
             }
