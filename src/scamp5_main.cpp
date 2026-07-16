@@ -271,10 +271,14 @@ int main()
                 scamp5_kernel_begin();
                     res(C);                  // C accumulates the mean wrapped difference
                 scamp5_kernel_end();
+                //Measured (couple=0 vs couple=1 traces, 2026-07-16): rows are
+                //as expected, but the chip's x axis is MIRRORED - the east
+                //term's missing neighbour enters at col 0 and west's at col
+                //255 (patching the opposite columns killed all W/E wraps).
                 COUPLE_DIR(north,   0,  0,   0,255)   // row 0 has no north neighbour
                 COUPLE_DIR(south, 255,  0, 255,255)   // row 255 has no south neighbour
-                COUPLE_DIR(east,    0,255, 255,255)   // col 255 has no east neighbour
-                COUPLE_DIR(west,    0,  0, 255,  0)   // col 0 has no west neighbour
+                COUPLE_DIR(east,    0,  0, 255,  0)   // col 0 has no east neighbour (x mirrored)
+                COUPLE_DIR(west,    0,255, 255,255)   // col 255 has no west neighbour (x mirrored)
                 for(int s=0;s<couple;s++){ scamp5_kernel_begin(); diva(C,D,E); scamp5_kernel_end(); }
                 scamp5_kernel_begin(); add(A,A,C); scamp5_kernel_end();  // theta += K*avg wrapped diff
             }
