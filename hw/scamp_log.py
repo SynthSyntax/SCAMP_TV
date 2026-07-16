@@ -316,6 +316,11 @@ def cmd_trace(args):
           f"(a free-running border at base 4 advances >= ~4.6)")
     print(f"wraps/pixel over {T} frames: {raster.sum() / raster.shape[1]:.2f} "
           f"(expect ~{T / 26:.0f} if free-running at omega ~4.6)")
+    for name, l in zip("NSWE", range(4)):
+        sl = raster[:, l * N:(l + 1) * N]
+        print(f"  line {name}: {int(sl.sum()):6d} wraps "
+              f"({sl.sum() / N:.2f}/pixel), mean phase advance "
+              f"{np.abs(d[:, l * N:(l + 1) * N]).mean():.2f}")
 
 
 def cmd_calibrate(args):
