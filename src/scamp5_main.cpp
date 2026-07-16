@@ -282,16 +282,19 @@ int main()
             scamp5_in(D,-60);
             scamp5_in(E,-120);
             scamp5_kernel_begin();
-                all();             // DREG writes are FLAG-gated: clear the
-                CLR(R11);          // latch EVERYWHERE first, or non-wrapping
-                                   // pixels keep last frame's stale events
+                all();
+                CLR(R11);          // fresh latch (insurance for either gating semantics)
                 where(A,D);        // FLAG := theta > +60
                     MOV(R11,FLAG); //   R11 := pixels wrapping THIS frame = the events
-                    add(A,A,E);    //   theta -= 120  (wrap down)
+                    add(A,A,E);    //   theta -= 120  (wrap down; analog IS FLAG-gated)
                 all();
-                WHERE(R10);        // FLAG := interior
-                    CLR(R11);      //   no events there: border lines only
-                ALL();
+                // Border masking with PURE LOGIC. Measured on silicon:
+                // DREG writes DO NOT honour FLAG - a CLR(R11) under
+                // WHERE(R10) cleared every pixel, killing all events (only a
+                // stuck defective DREG cell survived). So compute
+                // R11 := R11 AND NOT interior with unconditional ops:
+                NOT(R12,R11);      // R12 := not-an-event
+                NOR(R11,R12,R10);  // R11 := NOT(no-event OR interior) = event AND border
             scamp5_kernel_end();
             scamp5_in(E,120);
             scamp5_kernel_begin();
@@ -315,14 +318,15 @@ int main()
             }
 
             //event readout: sparse address-event scan of the wrap latch.
-            //The buffer is prefilled with (1,1) - an interior coordinate the
-            //border mask makes impossible - so the first (1,1) marks the end
-            //of the list and gives the count without any on-chip counting.
+            //Measured on silicon: scan_events ZERO-FILLS every unused buffer
+            //slot (a prefilled sentinel does not survive), so the count is
+            //recovered by trimming (0,0) pairs from the back. Caveat: a real
+            //event at scan-coordinate (0,0) that lands adjacent to the filler
+            //is absorbed - at most one corner event per frame, ignorable.
             if(event_readout || ep_left > 0){
-                for(int i=0;i<EV_MAX*2;i++) ev_buf[i] = 1;
                 scamp5_scan_events(R11, ev_buf, EV_MAX);
-                int cnt = 0;
-                while(cnt < EV_MAX && !(ev_buf[2*cnt]==1 && ev_buf[2*cnt+1]==1)) cnt++;
+                int cnt = EV_MAX;
+                while(cnt > 0 && ev_buf[2*cnt-2]==0 && ev_buf[2*cnt-1]==0) cnt--;
                 ev_pkt[0] = t;
                 ev_pkt[1] = cnt;
                 for(int i=0;i<cnt;i++)

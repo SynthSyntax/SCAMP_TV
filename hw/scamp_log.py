@@ -144,8 +144,11 @@ def parse_episodes(path: str, flip_scan: bool = True):
                     gt_rows, gt_slot = np.zeros((N, N), np.uint8), "gt1"
             elif cur is not None and 0 <= fid < cur["config"]["n_frames"]:
                 cnt = int(flat[1])
-                for w in flat[2:2 + cnt]:
-                    cur["raw_events"].append((fid, (int(w) >> 8) & 0xFF, int(w) & 0xFF))
+                w = flat[2:2 + cnt]
+                while len(w) and w[-1] == 0:   # scan_events zero-fill, defensive
+                    w = w[:-1]
+                for wi in w:
+                    cur["raw_events"].append((fid, (int(wi) >> 8) & 0xFF, int(wi) & 0xFF))
                 cur["n_ev_frames"] += 1
                 if cur["gt1"] is not None:      # events after end = stray, new ep missing
                     cur["why"] = "events after end marker"
