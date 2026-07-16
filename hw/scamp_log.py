@@ -118,11 +118,17 @@ def parse_episodes(path: str, flip_scan: bool = True):
             ep["ok"], ep["why"] = False, (f"only {ep['n_ev_frames']}/"
                                           f"{ep['config']['n_frames']} frames")
         else:
-            drift = float(np.abs(ep["gt0"].astype(np.float32)
-                                 - ep["gt1"].astype(np.float32)).mean())
+            # normalized comparison: display gating changes the frame period,
+            # hence the exposure, between the idle start capture and the end
+            # capture - global brightness shifts are NOT scene motion
+            a = ep["gt0"].astype(np.float32)
+            b = ep["gt1"].astype(np.float32)
+            a = (a - a.mean()) / (a.std() + 1e-6)
+            b = (b - b.mean()) / (b.std() + 1e-6)
+            drift = float(np.abs(a - b).mean())
             ep["gt_drift"] = drift
-            if drift > 6.0:
-                ep["ok"], ep["why"] = False, f"scene changed (gt drift {drift:.1f})"
+            if drift > 0.5:
+                ep["ok"], ep["why"] = False, f"scene changed (norm gt drift {drift:.2f})"
             else:
                 ep["ok"], ep["why"] = True, ""
         if not ep["ok"]:
@@ -267,6 +273,48 @@ def cmd_debug(args):
           "not applied on R11 (kernel fix)")
 
 
+def cmd_trace(args):
+    """Plot the episode's analog border data: phase field, wrap raster, and a
+    few individual pixels. A healthy oscillating border shows sawtooths;
+    a flat trace means the border is pinned (e.g. by edge-boundary coupling)
+    and explains missing wrap events."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    eps, _ = parse_episodes(args.log, args.flip_scan)
+    eps = [e for e in eps if e["edges"] is not None]
+    if not eps:
+        sys.exit("no episode with analog edges - record with 'edge readout' on")
+    ep = eps[args.ep]
+    E = ep["edges"].astype(np.int32)          # (T, P)
+    d = E[1:] - E[:-1]
+    raster = d < -HALF
+
+    fig, ax = plt.subplots(3, 1, figsize=(13, 11))
+    im = ax[0].imshow(E.T, aspect="auto", cmap="twilight", interpolation="none")
+    ax[0].set_title("analog border phase (episode)")
+    ax[0].set_ylabel("border index [N|S|W|E]")
+    fig.colorbar(im, ax=ax[0])
+    ax[1].imshow(raster.T, aspect="auto", cmap="gray_r", interpolation="none")
+    ax[1].set_title(f"analog wraps: {int(raster.sum())} total")
+    ax[1].set_ylabel("border index")
+    for p in (5, 128, 300, 640, 900):
+        ax[2].plot(E[:, p], lw=1, label=f"p={p}")
+    ax[2].set_title("individual border pixels (sawtooth = healthy oscillation)")
+    ax[2].set_xlabel("frame")
+    ax[2].legend(ncol=5, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(args.fig, dpi=110)
+    print(f"wrote {args.fig}")
+
+    T = E.shape[0]
+    print(f"mean |dphase|/frame: {np.abs(d).mean():.2f} units "
+          f"(a free-running border at base 4 advances >= ~4.6)")
+    print(f"wraps/pixel over {T} frames: {raster.sum() / raster.shape[1]:.2f} "
+          f"(expect ~{T / 26:.0f} if free-running at omega ~4.6)")
+
+
 def cmd_calibrate(args):
     """Find scan_events' orientation from an episode recorded with BOTH
     readouts on: wraps in the analog border trace must coincide with events."""
@@ -281,6 +329,12 @@ def cmd_calibrate(args):
     T = raster_a.shape[0] + 1
 
     print(f"analog wraps: {raster_a.sum()}  events: {len(ep['raw_events'])}")
+    # The analog scan direction may differ per line (rows vs columns), so for
+    # each candidate event orientation, allow each of the 4 analog border
+    # lines [N,S,W,E] to be reversed independently and keep whichever way
+    # matches better. rev=1 means the line needed reversing ON TOP of the
+    # global flip_scan default.
+    lines = [slice(l * N, (l + 1) * N) for l in range(4)]
     best = []
     for swap in (False, True):
         for fx in (False, True):
@@ -292,15 +346,27 @@ def cmd_calibrate(args):
                         raster_e[t - 1, p] = True
                 for shift in (-1, 0, 1):
                     a = raster_a if shift == 0 else np.roll(raster_a, shift, axis=0)
-                    inter = float(np.logical_and(a, raster_e).sum())
-                    union = float(np.logical_or(a, raster_e).sum())
-                    iou = inter / union if union else 0.0
-                    best.append((iou, swap, fx, fy, shift, interior))
+                    ti = tu = 0.0
+                    revs = []
+                    for sl in lines:
+                        al, el = a[:, sl], raster_e[:, sl]
+                        cand = []
+                        for rev, av in ((0, al), (1, al[:, ::-1])):
+                            i = float(np.logical_and(av, el).sum())
+                            u = float(np.logical_or(av, el).sum())
+                            cand.append((i / u if u else 0.0, i, u, rev))
+                        _, i, u, rev = max(cand)
+                        ti += i
+                        tu += u
+                        revs.append(rev)
+                    iou = ti / tu if tu else 0.0
+                    best.append((iou, swap, fx, fy, shift, interior, tuple(revs)))
     best.sort(reverse=True)
     print("top orientation candidates (IoU of analog-wrap vs event rasters):")
-    for iou, swap, fx, fy, shift, interior in best[:5]:
+    for iou, swap, fx, fy, shift, interior, revs in best[:5]:
         print(f"  IoU {iou:.3f}  --swap-xy={swap} --flip-x={fx} --flip-y={fy} "
-              f"(frame shift {shift:+d}, {interior} interior hits)")
+              f"(shift {shift:+d}, {interior} interior, extra line reversals "
+              f"[N,S,W,E]={list(revs)})")
     iou = best[0][0]
     print("=> confident match" if iou > 0.8 else
           "=> LOW confidence - check flip_scan / recording", f"(IoU {iou:.3f})")
@@ -349,6 +415,12 @@ def main():
     c = sub.add_parser("calibrate", help="pin down scan_events orientation")
     c.add_argument("log")
     c.set_defaults(fn=cmd_calibrate)
+
+    t = sub.add_parser("trace", help="plot the analog border trace (is the border oscillating?)")
+    t.add_argument("log")
+    t.add_argument("--ep", type=int, default=0)
+    t.add_argument("--fig", default="hw_trace.png")
+    t.set_defaults(fn=cmd_trace)
 
     d = sub.add_parser("debug", help="raw event-packet stats (diagnose count/mask bugs)")
     d.add_argument("log")
